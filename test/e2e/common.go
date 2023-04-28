@@ -74,6 +74,20 @@ func newSecret(namespace string, name string, data map[string][]byte) *corev1.Se
 		Data:       data,
 	}
 }
+func newPodWithAuthenticatedRegistry(namespace string, name string, containerName string, imagename string, runtimeclass string) *corev1.Pod {
+	servicetoken := false
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec: corev1.PodSpec{
+			Containers:                   []corev1.Container{{Name: containerName, Image: imagename}},
+			ImagePullSecrets:             []corev1.LocalObjectReference{{Name: "all-icr-io"}},
+			AutomountServiceAccountToken: &servicetoken,
+			DNSPolicy:                    "ClusterFirst",
+			RestartPolicy:                "Never",
+			RuntimeClassName:             &runtimeclass,
+		},
+	}
+}
 
 // CloudAssert defines assertions to perform on the cloud provider.
 type CloudAssert interface {

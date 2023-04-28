@@ -2,6 +2,8 @@ package e2e
 
 import (
 	"context"
+	"encoding/base64"
+	"io/ioutil"
 	"os"
 	"testing"
 
@@ -98,6 +100,19 @@ func TestMain(m *testing.M) {
 	testEnv.Setup(func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
 		log.Info("Do setup")
 		var err error
+		if os.Getenv("AA_KBC") == "offline_fs_kbc" {
+			log.Info("Setting up auth.json")
+			if os.Getenv("BASE64_AUTH") == "" || os.Getenv("AUTH_REGISTRY_IMAGE") == "" {
+				log.Fatal("Export base64 version of auth.json in BASE64_AUTH and image in AUTH_REGISTRY_IMAGE")
+			}
+			rawDecodedText, err := base64.StdEncoding.DecodeString(os.Getenv("BASE64_AUTH"))
+			if err != nil {
+				return ctx, err
+			}
+			if err := ioutil.WriteFile("../../install/overlays/ibmcloud/auth.json", rawDecodedText, 0644); err != nil {
+				return ctx, err
+			}
+		}
 
 		if shouldProvisionCluster {
 			log.Info("Cluster provisioning")
@@ -130,6 +145,11 @@ func TestMain(m *testing.M) {
 	testEnv.Finish(func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
 		if !shouldTeardown {
 			return ctx, nil
+		}
+		if os.Getenv("AA_KBC") == "offline_fs_kbc" {
+			if err := os.Remove("../../install/overlays/ibmcloud/auth.json"); err != nil {
+				return ctx, err
+			}
 		}
 		if shouldProvisionCluster {
 			if err = provisioner.DeleteCluster(ctx, cfg); err != nil {

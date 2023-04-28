@@ -6,11 +6,16 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"math/rand"
+	"os"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/e2e-framework/klient/wait"
 	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
 	envconf "sigs.k8s.io/e2e-framework/pkg/envconf"
@@ -255,4 +260,77 @@ func doTestCreatePeerPodContainerWithExternalIPAccess(t *testing.T, assert Cloud
 			return ctx
 		}).Feature()
 	testEnv.Test(t, PublicpodFeature)
+}
+func doTestCreatePodFromAuthenticatedRegistry(t *testing.T, assert CloudAssert) {
+	namespace := "default"
+	name := "authenticated-peer-pod" + strconv.Itoa(rand.Intn(1000))
+	pod := newPodWithAuthenticatedRegistry(namespace, name, name, os.Getenv("AUTH_REGISTRY_IMAGE"), "kata")
+
+	AuthenticatedPodFeature := features.New("Authenticated Peer Pod").
+		WithSetup("Create pod", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			client, err := cfg.NewClient()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err = client.Resources().Create(ctx, pod); err != nil {
+				t.Fatal(err)
+			}
+			if err = wait.For(conditions.New(client.Resources()).PodPhaseMatch(pod, v1.PodPhase("Pending")), wait.WithTimeout(WAIT_POD_RUNNING_TIMEOUT)); err != nil {
+				t.Fatal(err)
+			}
+
+			return ctx
+		}).
+		Assess("Pod Created from Authenticated Registry", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			var podlist v1.PodList
+			err := cfg.Client().Resources(namespace).List(context.TODO(), &podlist)
+			if err != nil {
+				t.Fatal(err)
+			}
+			clienset, err := kubernetes.NewForConfig(cfg.Client().RESTConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for _, i := range podlist.Items {
+				if i.ObjectMeta.Name == name {
+					watcher, err := clienset.CoreV1().Events(namespace).Watch(context.Background(), metav1.ListOptions{})
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer watcher.Stop()
+					for event := range watcher.ResultChan() {
+						if event.Object.(*v1.Event).InvolvedObject.Name == i.ObjectMeta.Name {
+							if strings.Contains(event.Object.(*v1.Event).Message, "UNAUTHORIZED") {
+								log.Infof("Failed to Pull image from Authenticated registry")
+								t.Errorf("%s", event.Object.(*v1.Event).Message)
+								break
+							}
+							if event.Object.(*v1.Event).Reason == "Started" {
+								log.Info("Image from Authenticated registry:", i.Spec.Containers[0].Image)
+								log.Info("Started Pod with image from Authenticated Registry....")
+								break
+							}
+
+						}
+					}
+
+				}
+			}
+
+			return ctx
+		}).
+		Teardown(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			client, err := cfg.NewClient()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = client.Resources().Delete(ctx, pod); err != nil {
+				t.Fatal(err)
+			}
+
+			return ctx
+		}).Feature()
+	testEnv.Test(t, AuthenticatedPodFeature)
 }
