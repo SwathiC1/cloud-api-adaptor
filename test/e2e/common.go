@@ -1,7 +1,11 @@
 package e2e
 
 import (
+	"math/rand"
+	"strconv"
 	"testing"
+
+	batchv1 "k8s.io/api/batch/v1"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,7 +44,7 @@ func newPod(namespace string, podName string, containerName string, imageName st
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: namespace},
 		Spec: corev1.PodSpec{
-			Containers:       []corev1.Container{{Name: containerName, Image: imageName}},
+			Containers:       []corev1.Container{{Name: containerName, Image: imageName, ImagePullPolicy: corev1.PullAlways}},
 			RuntimeClassName: &runtimeClassName,
 		},
 	}
@@ -86,6 +90,39 @@ func newSecret(namespace string, name string, data map[string][]byte) *corev1.Se
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Data:       data,
 	}
+}
+
+// newJob returns a new job
+func newJob(namespace string, name string) *batchv1.Job {
+	runtimeClassName := "kata-remote"
+	BackoffLimit := int32(8)
+	TerminateGracePeriod := int64(0)
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: batchv1.JobSpec{
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Namespace: namespace},
+				Spec: corev1.PodSpec{
+					TerminationGracePeriodSeconds: &TerminateGracePeriod,
+					Containers: []corev1.Container{{
+						Name:    name,
+						Image:   "quay.io/prometheus/busybox:latest",
+						Command: []string{"/bin/sh", "-c", "echo 'scale=5; 4*a(1)' | bc -l"},
+					}},
+					RestartPolicy:    corev1.RestartPolicyNever,
+					RuntimeClassName: &runtimeClassName,
+				},
+			},
+			BackoffLimit: &BackoffLimit,
+		},
+	}
+}
+func newLargePod(namespace string) *corev1.Pod {
+	name := "large-new-" + strconv.Itoa(rand.Intn(200)) + "-pod"
+	return newPod(namespace, name, "large-container", "quay.io/sudharshanibm3/large-image", withCommand([]string{"/bin/sh", "-c", "sleep 3600"}))
 }
 
 // CloudAssert defines assertions to perform on the cloud provider.
