@@ -44,6 +44,10 @@ type testCommand struct {
 	testCommandStdoutFn func(stdout bytes.Buffer) bool
 	containerName       string
 }
+type instanceType struct {
+	testSuccessfn func(instance string) bool
+	testFailurefn func(error error) bool
+}
 
 type testCase struct {
 	testing              *testing.T
@@ -61,6 +65,7 @@ type testCase struct {
 	imagePullTimer       bool
 	isAuth               bool
 	AuthImageStatus      string
+	testInstanceTypes    []instanceType
 }
 
 func (tc *testCase) withConfigMap(configMap *v1.ConfigMap) *testCase {
@@ -90,6 +95,11 @@ func (tc *testCase) withPod(pod *v1.Pod) *testCase {
 
 func (tc *testCase) withTestCommands(testCommands []testCommand) *testCase {
 	tc.testCommands = testCommands
+	return tc
+}
+
+func (tc *testCase) withInstanceTypes(testInstanceTypes []instanceType) *testCase {
+	tc.testInstanceTypes = testInstanceTypes
 	return tc
 }
 
@@ -225,7 +235,6 @@ func (tc *testCase) run() {
 			}
 
 			if tc.pod != nil {
-
 				if tc.imagePullTimer {
 					if err := client.Resources("confidential-containers-system").List(ctx, &podlist); err != nil {
 						t.Fatal(err)
@@ -251,16 +260,40 @@ func (tc *testCase) run() {
 					}
 					t.Logf("Log output of peer pod:%s", LogString)
 				}
-
-				if tc.isAuth {
-					if err := getAuthenticatedImageStatus(ctx, client, tc.AuthImageStatus, *tc.pod); err != nil {
+				if len(tc.testInstanceTypes) > 0 {
+					if err := client.Resources(tc.pod.Namespace).List(ctx, &podlist); err != nil {
 						t.Fatal(err)
 					}
+					for _, testInstanceType := range tc.testInstanceTypes {
+						for _, podItem := range podlist.Items {
+							if podItem.ObjectMeta.Name == tc.pod.Name {
+								profile, error := tc.assert.validateInstanceType(t, tc.pod.Name)
+								if error != nil {
+									if error.Error() == "Failed to Create PodVM Instance" {
+										podEvent, err := podEventExtractor(ctx, client, *tc.pod)
+										if err != nil {
+											t.Fatal(err)
+										}
+										if !testInstanceType.testFailurefn(errors.New(podEvent.EventDescription)) {
+											t.Fatal(fmt.Errorf("Pod Failed to execute expected error message %v", error.Error()))
+										}
+									} else {
+										t.Fatal(error)
+									}
 
-					t.Logf("PodVM has successfully reached %v state with authenticated Image - %v", tc.AuthImageStatus, os.Getenv("AUTHENTICATED_REGISTRY_IMAGE"))
+								}
+								if profile != "" {
+									if !testInstanceType.testSuccessfn(profile) {
+										t.Fatal(fmt.Errorf("PodVM Created with Differenct Instance Type %v", profile))
+									}
+								}
 
+							} else {
+								t.Fatal("Pod Not Found...")
+							}
+						}
+					}
 				}
-
 				if tc.podState == v1.PodRunning {
 					if err := client.Resources(tc.pod.Namespace).List(ctx, &podlist); err != nil {
 						t.Fatal(err)
@@ -268,7 +301,6 @@ func (tc *testCase) run() {
 					if len(tc.testCommands) > 0 {
 						for _, testCommand := range tc.testCommands {
 							var stdout, stderr bytes.Buffer
-
 							for _, podItem := range podlist.Items {
 								if podItem.ObjectMeta.Name == tc.pod.Name {
 									//adding sleep time to intialize container and ready for Executing commands
@@ -383,6 +415,35 @@ func timeExtractor(log string) (string, error) {
 		return "", errors.New("Invalid Time Data")
 	}
 	return matchString[0], nil
+}
+
+type PodEvents struct {
+	EventType        string
+	EventDescription string
+	EventReason      string
+}
+
+func podEventExtractor(ctx context.Context, client klient.Client, pod v1.Pod) (*PodEvents, error) {
+	clientset, err := kubernetes.NewForConfig(client.RESTConfig())
+	if err != nil {
+		return nil, err
+	}
+	watcher, err := clientset.CoreV1().Events(pod.Namespace).Watch(ctx, metav1.ListOptions{FieldSelector: fmt.Sprintf("involvedObject.name=%s", pod.Name)})
+	if err != nil {
+		return nil, err
+	}
+	defer watcher.Stop()
+	for event := range watcher.ResultChan() {
+
+		if event.Object.(*v1.Event).Type == v1.EventTypeWarning {
+			var newPodEvents PodEvents
+			newPodEvents.EventType = event.Object.(*v1.Event).Type
+			newPodEvents.EventDescription = event.Object.(*v1.Event).Message
+			newPodEvents.EventType = event.Object.(*v1.Event).Reason
+			return &newPodEvents, nil
+		}
+	}
+	return nil, errors.New("No Events Found in PodVM")
 }
 
 func watchImagePullTime(ctx context.Context, client klient.Client, caaPod v1.Pod, Pod v1.Pod) (string, error) {
@@ -838,4 +899,160 @@ func doTestCreatePeerPodWithAuthenticatedImageWithoutCredentials(t *testing.T, a
 	imageName := os.Getenv("AUTHENTICATED_REGISTRY_IMAGE")
 	pod := newPod(namespace, podName, podName, imageName, withRestartPolicy(v1.RestartPolicyNever))
 	newTestCase(t, "InvalidAuthImagePeerPod", assert, "Peer pod with Authenticated Image with Invalid Credentials has been created").withPod(pod).withAuthenticatedImage().withAuthImageStatus(expectedAuthStatus).withCustomPodState(v1.PodPending).run()
+}
+
+func doTestPodVMwithNoAnnotations(t *testing.T, assert CloudAssert, expectedType string) {
+
+	namespace := envconf.RandomName("default", 7)
+	podName := "no-annotations"
+	containerName := "busybox"
+	imageName := "busybox:latest"
+	pod := newPod(namespace, podName, containerName, imageName, withCommand([]string{"/bin/sh", "-c", "sleep 3600"}))
+	testInstanceTypes := []instanceType{
+		{
+			testSuccessfn: func(instance string) bool {
+				if instance == expectedType {
+					log.Infof("PodVM Created with %s Instance type successfully...", instance)
+					return true
+				} else {
+					log.Infof("Failed to Create PodVM with %s Instance type", expectedType)
+					return false
+				}
+			},
+		},
+	}
+	newTestCase(t, "PodVMWithNoAnnotations", assert, "PodVM with No Annotation is created").withPod(pod).withInstanceTypes(testInstanceTypes).run()
+}
+
+func doTestPodVMwithAnnotationsInstanceType(t *testing.T, assert CloudAssert, expectedType string) {
+	namespace := envconf.RandomName("default", 7)
+	podName := "annotations-instance-type"
+	containerName := "busybox"
+	imageName := "busybox:latest"
+	annotationData := map[string]string{
+		"io.katacontainers.config.hypervisor.machine_type": expectedType,
+	}
+	pod := newPod(namespace, podName, containerName, imageName, withCommand([]string{"/bin/sh", "-c", "sleep 3600"}), withAnnotations(annotationData))
+
+	testInstanceTypes := []instanceType{
+		{
+			testSuccessfn: func(instance string) bool {
+				if instance == expectedType {
+					log.Infof("PodVM Created with %s Instance type successfully...", instance)
+					return true
+				} else {
+					log.Infof("Failed to Create PodVM with %s Instance type", expectedType)
+					return false
+				}
+			},
+		},
+	}
+	newTestCase(t, "PodVMwithAnnotationsInstanceType", assert, "PodVM with Annotation is created").withPod(pod).withInstanceTypes(testInstanceTypes).run()
+}
+
+func doTestPodVMwithAnnotationsCPUMemory(t *testing.T, assert CloudAssert, expectedType string) {
+	namespace := envconf.RandomName("default", 7)
+	podName := "annotations-cpu-mem"
+	containerName := "busybox"
+	imageName := "busybox:latest"
+	annotationData := map[string]string{
+		"io.katacontainers.config.hypervisor.default_vcpus":  "2",
+		"io.katacontainers.config.hypervisor.default_memory": "12288",
+	}
+	pod := newPod(namespace, podName, containerName, imageName, withCommand([]string{"/bin/sh", "-c", "sleep 3600"}), withAnnotations(annotationData))
+
+	testInstanceTypes := []instanceType{
+		{
+			testSuccessfn: func(instance string) bool {
+				if instance == expectedType {
+					log.Infof("PodVM Created with %s Instance type successfully...", instance)
+					return true
+				} else {
+					log.Infof("Failed to Create PodVM with %s Instance type", expectedType)
+					return false
+				}
+			},
+		},
+	}
+	newTestCase(t, "PodVMwithAnnotationsCPUMemory", assert, "PodVM with Annotations CPU Memory is created").withPod(pod).withInstanceTypes(testInstanceTypes).run()
+}
+
+func doTestPodVMwithAnnotationsInvalidInstanceType(t *testing.T, assert CloudAssert, expectedType string) {
+	namespace := envconf.RandomName("default", 7)
+	podName := "annotations-invalid-instance-type"
+	containerName := "busybox"
+	imageName := "busybox:latest"
+	expectedErrorMessage := `requested instance type ("` + expectedType + `") is not part of supported instance types list`
+	annotationData := map[string]string{
+		"io.katacontainers.config.hypervisor.machine_type": expectedType,
+	}
+	pod := newPod(namespace, podName, containerName, imageName, withCommand([]string{"/bin/sh", "-c", "sleep 3600"}), withAnnotations(annotationData))
+	testInstanceTypes := []instanceType{
+		{
+			testFailurefn: func(errorMsg error) bool {
+				if strings.Contains(errorMsg.Error(), expectedErrorMessage) {
+					log.Infof("Got Expected Error: %v", errorMsg.Error())
+					return true
+				} else {
+					log.Infof("Failed to Get Expected Error: %v", errorMsg.Error())
+					return false
+				}
+			},
+		},
+	}
+	newTestCase(t, "PodVMwithAnnotationsInvalidInstanceType", assert, "Failed to Create PodVM with Annotations Invalid InstanceType").withPod(pod).withInstanceTypes(testInstanceTypes).withCustomPodState(v1.PodPending).run()
+}
+
+func doTestPodVMwithAnnotationsLargerMemory(t *testing.T, assert CloudAssert) {
+	namespace := envconf.RandomName("default", 7)
+	podName := "annotations-too-big-mem"
+	containerName := "busybox"
+	imageName := "busybox:latest"
+	expectedErrorMessage := "failed to get instance type based on vCPU and memory annotations: no instance type found for the given vcpus (2) and memory (18432)"
+	annotationData := map[string]string{
+		"io.katacontainers.config.hypervisor.default_vcpus":  "2",
+		"io.katacontainers.config.hypervisor.default_memory": "18432",
+	}
+	pod := newPod(namespace, podName, containerName, imageName, withCommand([]string{"/bin/sh", "-c", "sleep 3600"}), withAnnotations(annotationData))
+	testInstanceTypes := []instanceType{
+		{
+			testFailurefn: func(errorMsg error) bool {
+				if strings.Contains(errorMsg.Error(), expectedErrorMessage) {
+					log.Infof("Got Expected Error: %v", errorMsg.Error())
+					return true
+				} else {
+					log.Infof("Failed to Get Expected Error: %v", errorMsg.Error())
+					return false
+				}
+			},
+		},
+	}
+	newTestCase(t, "PodVMwithAnnotationsLargerMemory", assert, "Failed to Create PodVM with Annotations Larger Memory").withPod(pod).withInstanceTypes(testInstanceTypes).withCustomPodState(v1.PodPending).run()
+}
+
+func doTestPodVMwithAnnotationsLargerCPU(t *testing.T, assert CloudAssert) {
+	namespace := envconf.RandomName("default", 7)
+	podName := "annotations-too-big-cpu"
+	containerName := "busybox"
+	imageName := "busybox:latest"
+	expectedErrorMessage := "Number of cpus 3 specified in annotation default_vcpus is greater than the number of CPUs 2 on the system"
+	annotationData := map[string]string{
+		"io.katacontainers.config.hypervisor.default_vcpus":  "3",
+		"io.katacontainers.config.hypervisor.default_memory": "12288",
+	}
+	pod := newPod(namespace, podName, containerName, imageName, withCommand([]string{"/bin/sh", "-c", "sleep 3600"}), withAnnotations(annotationData))
+	testInstanceTypes := []instanceType{
+		{
+			testFailurefn: func(errorMsg error) bool {
+				if strings.Contains(errorMsg.Error(), expectedErrorMessage) {
+					log.Infof("Got Expected Error: %v", errorMsg.Error())
+					return true
+				} else {
+					log.Infof("Failed to Get Expected Error: %v", errorMsg.Error())
+					return false
+				}
+			},
+		},
+	}
+	newTestCase(t, "PodVMwithAnnotationsLargerCPU", assert, "Failed to Create PodVM with Annotations Larger CPU").withPod(pod).withInstanceTypes(testInstanceTypes).withCustomPodState(v1.PodPending).run()
 }
